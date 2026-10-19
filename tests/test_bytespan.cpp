@@ -1,7 +1,9 @@
 #include "bytespan/bytespan.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <span>
 #include <vector>
 
 #include "harness.hpp"
@@ -139,6 +141,25 @@ void the_writer_refuses_to_overrun_its_buffer() {
     CHECK(w.view().size() == 2);
 }
 
+// Nothing stops a caller handing the writer a span of the buffer it is writing
+// into — of view(), or of the array itself. Shifting a region one byte along is
+// the overlap memcpy leaves undefined, so this must come out right under ASan.
+void the_writer_copies_a_source_that_aliases_its_own_buffer() {
+    std::array<std::byte, 8> buffer{};
+    for (std::size_t i = 0; i < buffer.size(); ++i) {
+        buffer[i] = static_cast<std::byte>(i + 1);
+    }
+
+    writer w{buffer};
+    CHECK(w.u8(1));
+    CHECK(w.bytes(std::span(buffer).first(4)));
+    CHECK(w.ok());
+    CHECK(w.written() == 5);
+
+    const auto expected = raw({1, 1, 2, 3, 4, 6, 7, 8});
+    CHECK(std::equal(buffer.begin(), buffer.end(), expected.begin()));
+}
+
 }  // namespace
 
 int main() {
@@ -152,5 +173,6 @@ int main() {
     an_empty_buffer_reads_nothing_and_says_so();
     the_writer_round_trips_what_the_reader_reads();
     the_writer_refuses_to_overrun_its_buffer();
+    the_writer_copies_a_source_that_aliases_its_own_buffer();
     return harness::report("bytespan");
 }

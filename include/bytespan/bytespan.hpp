@@ -150,9 +150,12 @@ class writer {
         return out_.subspan(0, offset_);
     }
 
+    /// memmove, not memcpy: nothing stops a caller passing a span of this
+    /// writer's own buffer — of view(), say — and overlapping memcpy is
+    /// undefined rather than merely surprising.
     bool bytes(std::span<const std::byte> source) noexcept {
         if (!take(source.size())) return false;
-        std::memcpy(out_.data() + offset_ - source.size(), source.data(), source.size());
+        std::memmove(out_.data() + offset_ - source.size(), source.data(), source.size());
         return true;
     }
 
