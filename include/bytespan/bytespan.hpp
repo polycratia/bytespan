@@ -68,6 +68,19 @@ class reader {
     /// Skip n bytes without looking at them.
     bool skip(std::size_t n) noexcept { return take(n); }
 
+    /// True only when the parse consumed exactly the input: trailing bytes
+    /// poison the cursor, and a cursor that already failed stays refused even
+    /// though remaining() reports zero, so a poisoned parse cannot read as
+    /// complete. Like skip(), it belongs in the run of reads checked by ok().
+    bool expect_end() noexcept {
+        if (!ok_) return false;
+        if (offset_ != data_.size()) {
+            ok_ = false;
+            return false;
+        }
+        return true;
+    }
+
     [[nodiscard]] std::optional<std::uint8_t> u8() noexcept { return read<std::uint8_t>(endian::big); }
 
     [[nodiscard]] std::optional<std::uint16_t> u16(endian order) noexcept {

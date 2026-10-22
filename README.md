@@ -44,6 +44,20 @@ check gets forgotten.
 `size_t` can wrap; the bounds check is against the real remaining size, so a
 wrapped length cannot become a huge `memcpy`.
 
+**Bytes nobody asked for.** `expect_end()` is true only when the cursor is
+still `ok()` and sits exactly at the end of the input. Trailing bytes poison it
+like any other failure, and a cursor that already failed is refused too — its
+`remaining()` is zero for the opposite reason. It joins the run of reads and is
+covered by the same single `ok()`:
+
+```cpp
+const auto type    = r.u8();
+const auto version = r.u16(bytespan::endian::big);
+r.expect_end();
+
+if (!r.ok()) return std::nullopt;   // short, long, or mangled — all one check
+```
+
 **Silent endianness.** Byte order is a parameter, never a default. A parser that
 happens to work on this machine is not a parser.
 
@@ -86,7 +100,7 @@ Early, and small on purpose.
 
 | | |
 |---|---|
-| Reading | `u8`/`u16`/`u32`/`u64` in either byte order, raw spans, skip, length-prefixed payloads |
+| Reading | `u8`/`u16`/`u32`/`u64` in either byte order, raw spans, skip, length-prefixed payloads, `expect_end` |
 | Writing | the same set, bounds-checked, with a view of what was written |
 | Not yet | signed integers, varints, floating point, bit-level fields, `std::expected` return type for C++23 users |
 
@@ -100,3 +114,5 @@ make demo
 ## License
 
 MIT
+
+Maintained by [polycratia](https://polycratia.com).

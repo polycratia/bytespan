@@ -111,6 +111,43 @@ void an_empty_buffer_reads_nothing_and_says_so() {
     CHECK(!r.ok());
 }
 
+// A record that ends where the input ends.
+void expect_end_accepts_a_parse_that_consumed_everything() {
+    const auto data = raw({0x01, 0x02, 0x03});
+    reader r{data};
+
+    CHECK(r.u8() == 1u);
+    CHECK(r.u16(endian::big) == 0x0203u);
+    CHECK(r.expect_end());
+    CHECK(r.ok());
+
+    const std::span<const std::byte> empty;
+    reader nothing{empty};
+    CHECK(nothing.expect_end());
+    CHECK(nothing.ok());
+}
+
+// Bytes after the last field mean the input was not the record it claimed to
+// be, and a cursor that already failed must not look finished either — its
+// remaining() is zero for a different reason.
+void expect_end_refuses_trailing_bytes_and_a_failed_cursor() {
+    const auto data = raw({0x01, 0x02, 0x03, 0x04});
+    reader trailing{data};
+
+    CHECK(trailing.u8() == 1u);
+    CHECK(trailing.u16(endian::big) == 0x0203u);
+    CHECK(!trailing.expect_end());
+    CHECK(!trailing.ok());
+    CHECK(trailing.offset() == 3);
+
+    const auto truncated = raw({0x01, 0x02});
+    reader poisoned{truncated};
+    CHECK(!poisoned.u32(endian::big).has_value());
+    CHECK(poisoned.remaining() == 0);
+    CHECK(!poisoned.expect_end());
+    CHECK(!poisoned.ok());
+}
+
 void the_writer_round_trips_what_the_reader_reads() {
     std::array<std::byte, 16> buffer{};
     writer w{buffer};
@@ -171,6 +208,8 @@ int main() {
     an_enormous_length_prefix_cannot_wrap_into_a_read();
     skip_and_bytes_respect_the_end();
     an_empty_buffer_reads_nothing_and_says_so();
+    expect_end_accepts_a_parse_that_consumed_everything();
+    expect_end_refuses_trailing_bytes_and_a_failed_cursor();
     the_writer_round_trips_what_the_reader_reads();
     the_writer_refuses_to_overrun_its_buffer();
     the_writer_copies_a_source_that_aliases_its_own_buffer();
