@@ -81,6 +81,34 @@ void an_honest_length_prefix_is_read() {
     CHECK(r.remaining() == 1);
 }
 
+// A refusal has to name the field it refused, the way it does for every other
+// read — the prefix is part of that field, not progress through it.
+void a_refused_length_prefixed_read_leaves_the_offset_at_the_prefix() {
+    const auto lying = raw({0x01, 0xFF, 0xFF, 0xAA, 0xBB});
+    reader r{lying};
+    CHECK(r.u8() == 1u);
+    CHECK(!r.length_prefixed_u16(endian::big).has_value());
+    CHECK(r.offset() == 1);
+    CHECK(!r.ok());
+    CHECK(r.remaining() == 0);
+
+    const auto wide = raw({0x01, 0x00, 0x00, 0x00, 0x05, 0xAA});
+    reader thirty_two{wide};
+    CHECK(thirty_two.u8() == 1u);
+    CHECK(!thirty_two.length_prefixed_u32(endian::big).has_value());
+    CHECK(thirty_two.offset() == 1);
+    CHECK(!thirty_two.ok());
+    CHECK(thirty_two.remaining() == 0);
+
+    // The prefix itself cut short is refused at the same place.
+    const auto cut = raw({0x01, 0xFF});
+    reader short_prefix{cut};
+    CHECK(short_prefix.u8() == 1u);
+    CHECK(!short_prefix.length_prefixed_u16(endian::big).has_value());
+    CHECK(short_prefix.offset() == 1);
+    CHECK(!short_prefix.ok());
+}
+
 // A 32-bit length on a 32-bit size_t is the classic integer-overflow path into
 // a huge memcpy. The check is against the real remaining size, so it cannot.
 void an_enormous_length_prefix_cannot_wrap_into_a_read() {
@@ -205,6 +233,7 @@ int main() {
     failure_is_sticky();
     a_lying_length_prefix_is_refused();
     an_honest_length_prefix_is_read();
+    a_refused_length_prefixed_read_leaves_the_offset_at_the_prefix();
     an_enormous_length_prefix_cannot_wrap_into_a_read();
     skip_and_bytes_respect_the_end();
     an_empty_buffer_reads_nothing_and_says_so();

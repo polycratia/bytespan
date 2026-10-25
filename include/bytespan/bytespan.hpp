@@ -98,17 +98,25 @@ class reader {
     /// Read a length prefix and then that many bytes — the shape that goes
     /// wrong most often, so it is one call rather than two.
     [[nodiscard]] std::optional<std::span<const std::byte>> length_prefixed_u16(endian order) noexcept {
+        const std::size_t start = offset_;
         const auto length = u16(order);
         if (!length) return std::nullopt;
-        return bytes(*length);
+        const auto payload = bytes(*length);
+        // The prefix and the payload are one field, so a refusal has to leave
+        // the offset naming that field, not pointing inside it.
+        if (!payload) offset_ = start;
+        return payload;
     }
 
     [[nodiscard]] std::optional<std::span<const std::byte>> length_prefixed_u32(endian order) noexcept {
+        const std::size_t start = offset_;
         const auto length = u32(order);
         if (!length) return std::nullopt;
         // A 32-bit length on a 32-bit size_t could wrap; bytes() checks against
         // the real remaining size, so the wrap cannot turn into a read.
-        return bytes(static_cast<std::size_t>(*length));
+        const auto payload = bytes(static_cast<std::size_t>(*length));
+        if (!payload) offset_ = start;
+        return payload;
     }
 
   private:

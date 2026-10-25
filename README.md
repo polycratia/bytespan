@@ -38,7 +38,8 @@ loop cannot spin, and the cursor never moves past what it could actually read.
 
 **A length prefix that lies.** `length_prefixed_u16` and `length_prefixed_u32`
 read the count and the payload in one call, because splitting them is where the
-check gets forgotten.
+check gets forgotten. A refusal leaves `offset()` at the start of the prefix, so
+it names the field that was refused rather than a position inside it.
 
 **An integer overflow turning into a read.** A 32-bit length on a 32-bit
 `size_t` can wrap; the bounds check is against the real remaining size, so a
