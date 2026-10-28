@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -185,6 +186,18 @@ class writer {
     bool u32(std::uint32_t value, endian order) noexcept { return put(value, order); }
     bool u64(std::uint64_t value, endian order) noexcept { return put(value, order); }
 
+    /// Write the payload's size as a prefix and then the payload, mirroring
+    /// the reader: one call, because a count written apart from its body is
+    /// how the two drift. A payload too large for the prefix poisons the
+    /// writer rather than truncating the count.
+    bool length_prefixed_u16(std::span<const std::byte> payload, endian order) noexcept {
+        return length_prefixed<std::uint16_t>(payload, order);
+    }
+
+    bool length_prefixed_u32(std::span<const std::byte> payload, endian order) noexcept {
+        return length_prefixed<std::uint32_t>(payload, order);
+    }
+
   private:
     bool take(std::size_t n) noexcept {
         if (!ok_) return false;
@@ -206,6 +219,28 @@ class writer {
         }
         std::memcpy(out_.data() + offset_ - sizeof(T), &value, sizeof(T));
         return true;
+    }
+
+    template <typename T>
+    bool length_prefixed(std::span<const std::byte> payload, endian order) noexcept {
+        if (!ok_) return false;
+        const std::size_t size = payload.size();
+        if constexpr (sizeof(std::size_t) > sizeof(T)) {
+            if (size > static_cast<std::size_t>(std::numeric_limits<T>::max())) {
+                ok_ = false;
+                return false;
+            }
+        }
+        // Prefix and body are reserved in one check, so a refusal cannot leave
+        // a lone count behind. Subtracting from the room left, rather than
+        // adding the two, keeps the sum from wrapping on a 32-bit size_t.
+        const std::size_t room = out_.size() - offset_;
+        if (size > room || sizeof(T) > room - size) {
+            ok_ = false;
+            return false;
+        }
+        put(static_cast<T>(size), order);
+        return bytes(payload);
     }
 
     std::span<std::byte> out_;

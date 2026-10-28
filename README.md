@@ -41,6 +41,12 @@ read the count and the payload in one call, because splitting them is where the
 check gets forgotten. A refusal leaves `offset()` at the start of the prefix, so
 it names the field that was refused rather than a position inside it.
 
+**A count that does not match the bytes.** The writer has the same pair, taking
+the payload and writing its size ahead of it. A payload too large for the prefix
+fails the writer instead of truncating the count, and prefix and body are
+reserved in one bounds check — a refusal never leaves a lone length behind for
+someone to trust.
+
 **An integer overflow turning into a read.** A 32-bit length on a 32-bit
 `size_t` can wrap; the bounds check is against the real remaining size, so a
 wrapped length cannot become a huge `memcpy`.
@@ -74,7 +80,7 @@ std::array<std::byte, 64> buffer{};
 bytespan::writer w{buffer};
 w.u8(0x16);
 w.u16(0x0303, bytespan::endian::big);
-w.u32(payload_length, bytespan::endian::big);
+w.length_prefixed_u16(payload, bytespan::endian::big);
 if (!w.ok()) { /* the buffer was too small; nothing overran */ }
 send(w.view());
 ```

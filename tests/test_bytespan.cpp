@@ -225,6 +225,57 @@ void the_writer_copies_a_source_that_aliases_its_own_buffer() {
     CHECK(std::equal(buffer.begin(), buffer.end(), expected.begin()));
 }
 
+// The buffer is big enough for the bytes; the prefix is not big enough for the
+// count. Truncating it would write a record that lies about its own length.
+void a_payload_too_large_for_its_prefix_is_refused() {
+    std::vector<std::byte> buffer(80000);
+    const std::vector<std::byte> payload(70000, std::byte{0xAB});
+
+    writer w{buffer};
+    CHECK(!w.length_prefixed_u16(payload, endian::big));
+    CHECK(!w.ok());
+    CHECK(w.written() == 0);
+    CHECK(w.view().empty());
+}
+
+// Room for the count but not the body: all or nothing, so no lone prefix is
+// left for a reader to trust.
+void a_prefix_without_room_for_its_body_writes_nothing() {
+    std::array<std::byte, 4> buffer{};
+    const auto payload = raw({0xAA, 0xBB, 0xCC});
+
+    writer w{buffer};
+    CHECK(!w.length_prefixed_u16(payload, endian::big));
+    CHECK(!w.ok());
+    CHECK(w.written() == 0);
+    CHECK(buffer[0] == std::byte{0});
+    CHECK(buffer[1] == std::byte{0});
+}
+
+void an_honest_length_prefixed_write_round_trips() {
+    const auto payload = raw({0xAA, 0xBB, 0xCC});
+
+    for (const endian order : {endian::big, endian::little}) {
+        std::array<std::byte, 16> buffer{};
+        writer w{buffer};
+        CHECK(w.length_prefixed_u16(payload, order));
+        CHECK(w.length_prefixed_u32(payload, order));
+        CHECK(w.ok());
+        CHECK(w.written() == 12);
+
+        reader r{w.view()};
+        const auto first = r.length_prefixed_u16(order);
+        const auto second = r.length_prefixed_u32(order);
+        CHECK(first.has_value());
+        CHECK(second.has_value());
+        CHECK(first->size() == 3);
+        CHECK(second->size() == 3);
+        CHECK(std::equal(first->begin(), first->end(), payload.begin()));
+        CHECK(std::equal(second->begin(), second->end(), payload.begin()));
+        CHECK(r.expect_end());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -242,5 +293,8 @@ int main() {
     the_writer_round_trips_what_the_reader_reads();
     the_writer_refuses_to_overrun_its_buffer();
     the_writer_copies_a_source_that_aliases_its_own_buffer();
+    a_payload_too_large_for_its_prefix_is_refused();
+    a_prefix_without_room_for_its_body_writes_nothing();
+    an_honest_length_prefixed_write_round_trips();
     return harness::report("bytespan");
 }
