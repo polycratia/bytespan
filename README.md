@@ -10,9 +10,9 @@ is refusing to do the unchecked thing at all.
 ```console
 $ make demo
 well formed                  type=0x16 version=0x0303 payload=3 bytes
-header cut short             refused
-length field lies            refused
-empty input                  refused
+header cut short             refused at 1: short input (wanted 2, had 1)
+length field lies            refused at 3: short input (wanted 65537, had 3)
+empty input                  refused at 0: short input (wanted 1, had 0)
 ```
 
 ## The decision that makes it usable
@@ -68,6 +68,34 @@ if (!r.ok()) return std::nullopt;   // short, long, or mangled — all one check
 **Silent endianness.** Byte order is a parameter, never a default. A parser that
 happens to work on this machine is not a parser.
 
+## What it says when it refused
+
+`ok()` is enough to decide what to do; it is not enough to write the log line.
+So the cursor keeps the refusal — which field, why, and the two sizes that
+disagreed:
+
+```cpp
+if (const auto why = r.refused()) {        // nullopt while ok()
+    why->offset;     // first byte of the field that was refused
+    why->why;        // short_input or trailing_bytes; no_room or too_long when writing
+    why->wanted;     // bytes the field needed
+    why->available;  // bytes actually left from that offset
+}
+```
+
+The **first** refusal, never the last. Once the cursor is poisoned every later
+call fails as a consequence, and letting those consequences overwrite the record
+would bury the one failure that explains the parse — a header that died on a
+truncated `u32` should not end up reporting the `u8` that followed it.
+
+The sizes belong to the field, not to the call that happened to notice. A
+refused length-prefixed read reports the offset of the prefix and `prefix width
++ declared length`, so a header claiming 65535 bytes of payload in a 4-byte
+input says it wanted 65537 and had 4. On the writer, an overrun is `no_room`
+with the room that was left, while a payload too big to count in its prefix is
+`too_long` with the prefix maximum — 65535 or 4294967295 — as what was
+available, because room was never the problem.
+
 ## Use
 
 Header-only, C++20, no dependencies, no allocation, no exceptions. Copy
@@ -109,6 +137,7 @@ Early, and small on purpose.
 |---|---|
 | Reading | `u8`/`u16`/`u32`/`u64` in either byte order, raw spans, skip, length-prefixed payloads, `expect_end` |
 | Writing | the same set, bounds-checked, with a view of what was written |
+| Reporting | `refused()`: the first refusal with its offset, reason, and the sizes that disagreed |
 | Not yet | signed integers, varints, floating point, bit-level fields, `std::expected` return type for C++23 users |
 
 ## Development

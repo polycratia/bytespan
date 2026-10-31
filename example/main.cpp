@@ -5,6 +5,7 @@
 #include "bytespan/bytespan.hpp"
 
 #include <cstdio>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -17,10 +18,9 @@ struct record {
 };
 
 // The whole parse is a run of reads with one check at the end, which is the
-// only version of this anyone writes in practice.
-std::optional<record> parse(std::span<const std::byte> input) {
-    bytespan::reader r{input};
-
+// only version of this anyone writes in practice. The reader outlives the call
+// so the caller can ask what it refused.
+std::optional<record> parse(bytespan::reader& r) {
     record out{};
     const auto type = r.u8();
     const auto version = r.u16(bytespan::endian::big);
@@ -33,6 +33,16 @@ std::optional<record> parse(std::span<const std::byte> input) {
     return out;
 }
 
+const char* describe(bytespan::reason why) {
+    switch (why) {
+        case bytespan::reason::short_input: return "short input";
+        case bytespan::reason::no_room: return "no room";
+        case bytespan::reason::trailing_bytes: return "trailing bytes";
+        case bytespan::reason::too_long: return "too long";
+    }
+    return "unknown";
+}
+
 std::vector<std::byte> raw(std::initializer_list<int> values) {
     std::vector<std::byte> out;
     for (int value : values) out.push_back(static_cast<std::byte>(value));
@@ -40,9 +50,12 @@ std::vector<std::byte> raw(std::initializer_list<int> values) {
 }
 
 void show(const char* label, std::span<const std::byte> input) {
-    const auto parsed = parse(input);
+    bytespan::reader r{input};
+    const auto parsed = parse(r);
     if (!parsed) {
-        std::printf("%-28s refused\n", label);
+        const auto why = *r.refused();
+        std::printf("%-28s refused at %zu: %s (wanted %zu, had %zu)\n", label, why.offset,
+                    describe(why.why), why.wanted, why.available);
         return;
     }
     std::printf("%-28s type=0x%02X version=0x%04X payload=%zu bytes\n", label,

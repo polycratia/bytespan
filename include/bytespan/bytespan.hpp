@@ -8,7 +8,9 @@
 // The design decision that makes this usable rather than merely safe: a failed
 // read poisons the cursor. Parsing a header is a run of reads, and checking
 // every one of them is what people skip. Here they can read the whole header
-// and check once, because after the first failure nothing else succeeds.
+// and check once, because after the first failure nothing else succeeds. The
+// cursor keeps the first refusal — offset, reason, and the two sizes that
+// disagreed — so the single check still knows which field went wrong.
 //
 // Header-only, no allocation, no exceptions, C++20.
 #ifndef BYTESPAN_BYTESPAN_HPP
@@ -27,6 +29,24 @@ namespace bytespan {
 
 enum class endian { little, big };
 
+/// Why a cursor refused.
+enum class reason {
+    short_input,     ///< reader: the field needed more bytes than were left
+    no_room,         ///< writer: the call needed more room than was left
+    trailing_bytes,  ///< reader: expect_end found bytes after the last field
+    too_long,        ///< writer: a payload too large to count in its prefix
+};
+
+/// A refusal as it happened: which field, why, and the two sizes that
+/// disagreed. Offset is the first byte of the refused field, so it names that
+/// field rather than a position inside it.
+struct refusal {
+    std::size_t offset;
+    reason why;
+    std::size_t wanted;
+    std::size_t available;
+};
+
 namespace detail {
 
 /// std::byteswap is C++23. Reversing the bytes by hand keeps this header at
@@ -42,6 +62,14 @@ template <typename T>
     return out;
 }
 
+/// A declared length can be the largest size_t there is, and a refusal reports
+/// the prefix width added to it; saturating keeps the number in the record
+/// from wrapping round into a small, misleading one.
+[[nodiscard]] constexpr std::size_t saturating_add(std::size_t a, std::size_t b) noexcept {
+    const std::size_t limit = std::numeric_limits<std::size_t>::max();
+    return a > limit - b ? limit : a + b;
+}
+
 }  // namespace detail
 
 /// A cursor over bytes that cannot be moved past its end.
@@ -50,12 +78,17 @@ class reader {
     constexpr explicit reader(std::span<const std::byte> data) noexcept : data_(data) {}
 
     /// True while every read so far has succeeded.
-    [[nodiscard]] constexpr bool ok() const noexcept { return ok_; }
+    [[nodiscard]] constexpr bool ok() const noexcept { return !refusal_.has_value(); }
+
+    /// The refusal that poisoned the cursor, nullopt while ok(). It is the
+    /// first one: later calls fail as a consequence of it, and recording those
+    /// consequences would bury the failure that explains the parse.
+    [[nodiscard]] std::optional<refusal> refused() const noexcept { return refusal_; }
 
     /// Bytes not yet consumed. Zero once the cursor is poisoned, so that a
     /// caller looping on remaining() cannot spin.
     [[nodiscard]] constexpr std::size_t remaining() const noexcept {
-        return ok_ ? data_.size() - offset_ : 0;
+        return ok() ? data_.size() - offset_ : 0;
     }
 
     [[nodiscard]] constexpr std::size_t offset() const noexcept { return offset_; }
@@ -74,9 +107,9 @@ class reader {
     /// though remaining() reports zero, so a poisoned parse cannot read as
     /// complete. Like skip(), it belongs in the run of reads checked by ok().
     bool expect_end() noexcept {
-        if (!ok_) return false;
+        if (!ok()) return false;
         if (offset_ != data_.size()) {
-            ok_ = false;
+            poison({offset_, reason::trailing_bytes, 0, data_.size() - offset_});
             return false;
         }
         return true;
@@ -99,32 +132,22 @@ class reader {
     /// Read a length prefix and then that many bytes — the shape that goes
     /// wrong most often, so it is one call rather than two.
     [[nodiscard]] std::optional<std::span<const std::byte>> length_prefixed_u16(endian order) noexcept {
-        const std::size_t start = offset_;
-        const auto length = u16(order);
-        if (!length) return std::nullopt;
-        const auto payload = bytes(*length);
-        // The prefix and the payload are one field, so a refusal has to leave
-        // the offset naming that field, not pointing inside it.
-        if (!payload) offset_ = start;
-        return payload;
+        return length_prefixed<std::uint16_t>(order);
     }
 
     [[nodiscard]] std::optional<std::span<const std::byte>> length_prefixed_u32(endian order) noexcept {
-        const std::size_t start = offset_;
-        const auto length = u32(order);
-        if (!length) return std::nullopt;
-        // A 32-bit length on a 32-bit size_t could wrap; bytes() checks against
-        // the real remaining size, so the wrap cannot turn into a read.
-        const auto payload = bytes(static_cast<std::size_t>(*length));
-        if (!payload) offset_ = start;
-        return payload;
+        return length_prefixed<std::uint32_t>(order);
     }
 
   private:
+    void poison(refusal record) noexcept {
+        if (!refusal_) refusal_ = record;
+    }
+
     bool take(std::size_t n) noexcept {
-        if (!ok_) return false;
+        if (!ok()) return false;
         if (n > data_.size() - offset_) {
-            ok_ = false;
+            poison({offset_, reason::short_input, n, data_.size() - offset_});
             return false;
         }
         offset_ += n;
@@ -140,6 +163,28 @@ class reader {
     }
 
     template <typename T>
+    [[nodiscard]] std::optional<std::span<const std::byte>> length_prefixed(endian order) noexcept {
+        if (!ok()) return std::nullopt;
+        const std::size_t start = offset_;
+        const auto length = read<T>(order);
+        if (!length) return std::nullopt;  // the record already names the prefix
+        // A 32-bit length on a 32-bit size_t could wrap; the comparison is
+        // against the real remaining size, so the wrap cannot turn into a read.
+        const std::size_t wanted = static_cast<std::size_t>(*length);
+        if (wanted > data_.size() - offset_) {
+            // The prefix and the payload are one field, so a refusal names that
+            // field: the offset of the prefix, and the width of the count
+            // folded into what the field as a whole wanted.
+            poison({start, reason::short_input, detail::saturating_add(sizeof(T), wanted),
+                    data_.size() - start});
+            offset_ = start;
+            return std::nullopt;
+        }
+        offset_ += wanted;
+        return data_.subspan(offset_ - wanted, wanted);
+    }
+
+    template <typename T>
     static constexpr T fix(T value, endian order) noexcept {
         if constexpr (sizeof(T) == 1) {
             return value;
@@ -152,7 +197,7 @@ class reader {
 
     std::span<const std::byte> data_;
     std::size_t offset_ = 0;
-    bool ok_ = true;
+    std::optional<refusal> refusal_;
 };
 
 /// A cursor that writes, with the same discipline: an overrun fails the writer
@@ -161,10 +206,15 @@ class writer {
   public:
     constexpr explicit writer(std::span<std::byte> out) noexcept : out_(out) {}
 
-    [[nodiscard]] constexpr bool ok() const noexcept { return ok_; }
+    [[nodiscard]] constexpr bool ok() const noexcept { return !refusal_.has_value(); }
+
+    /// The refusal that poisoned the writer, nullopt while ok(), and the first
+    /// one for the same reason as the reader's.
+    [[nodiscard]] std::optional<refusal> refused() const noexcept { return refusal_; }
+
     [[nodiscard]] constexpr std::size_t written() const noexcept { return offset_; }
     [[nodiscard]] constexpr std::size_t remaining() const noexcept {
-        return ok_ ? out_.size() - offset_ : 0;
+        return ok() ? out_.size() - offset_ : 0;
     }
 
     /// What has been written so far, for handing to a socket.
@@ -199,10 +249,14 @@ class writer {
     }
 
   private:
+    void poison(refusal record) noexcept {
+        if (!refusal_) refusal_ = record;
+    }
+
     bool take(std::size_t n) noexcept {
-        if (!ok_) return false;
+        if (!ok()) return false;
         if (n > out_.size() - offset_) {
-            ok_ = false;
+            poison({offset_, reason::no_room, n, out_.size() - offset_});
             return false;
         }
         offset_ += n;
@@ -223,11 +277,12 @@ class writer {
 
     template <typename T>
     bool length_prefixed(std::span<const std::byte> payload, endian order) noexcept {
-        if (!ok_) return false;
+        if (!ok()) return false;
         const std::size_t size = payload.size();
         if constexpr (sizeof(std::size_t) > sizeof(T)) {
             if (size > static_cast<std::size_t>(std::numeric_limits<T>::max())) {
-                ok_ = false;
+                poison({offset_, reason::too_long, size,
+                        static_cast<std::size_t>(std::numeric_limits<T>::max())});
                 return false;
             }
         }
@@ -236,7 +291,7 @@ class writer {
         // adding the two, keeps the sum from wrapping on a 32-bit size_t.
         const std::size_t room = out_.size() - offset_;
         if (size > room || sizeof(T) > room - size) {
-            ok_ = false;
+            poison({offset_, reason::no_room, detail::saturating_add(sizeof(T), size), room});
             return false;
         }
         put(static_cast<T>(size), order);
@@ -245,7 +300,7 @@ class writer {
 
     std::span<std::byte> out_;
     std::size_t offset_ = 0;
-    bool ok_ = true;
+    std::optional<refusal> refusal_;
 };
 
 }  // namespace bytespan
