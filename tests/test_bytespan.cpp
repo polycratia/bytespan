@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <vector>
@@ -65,6 +66,7 @@ void failure_is_sticky() {
     CHECK(!r.u8().has_value());              // and stays failed, though a byte remains
     CHECK(!r.skip(0));
     CHECK(!r.bytes(0).has_value());
+    CHECK(!r.varint_u64().has_value());
     CHECK(!r.ok());
 }
 
@@ -240,6 +242,122 @@ void trailing_bytes_are_recorded_with_their_count() {
     CHECK(refused_with(r.refused(), 3, reason::trailing_bytes, 0, 2));
 }
 
+// A canonical LEB128 value has exactly one spelling, so the bytes are checked
+// against the published encoding rather than against whatever comes out.
+void varints_round_trip_through_their_exact_bytes() {
+    const struct {
+        std::uint64_t value;
+        std::vector<std::byte> encoded;
+    } cases[] = {
+        {0, raw({0x00})},
+        {127, raw({0x7F})},
+        {128, raw({0x80, 0x01})},
+        {300, raw({0xAC, 0x02})},
+        {UINT64_MAX, raw({0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01})},
+    };
+
+    for (const auto& one : cases) {
+        std::array<std::byte, 16> buffer{};
+        writer w{buffer};
+        CHECK(w.varint_u64(one.value));
+        CHECK(w.ok());
+        CHECK(w.written() == one.encoded.size());
+        CHECK(std::equal(w.view().begin(), w.view().end(), one.encoded.begin()));
+
+        reader round_trip{w.view()};
+        CHECK(round_trip.varint_u64() == one.value);
+        CHECK(round_trip.expect_end());
+        CHECK(round_trip.ok());
+
+        reader published{one.encoded};
+        CHECK(published.varint_u64() == one.value);
+        CHECK(published.expect_end());
+    }
+}
+
+// 0x80 0x00 is zero written the long way. Accepting it would give the same
+// value two spellings, which is a difference two parsers can be played off.
+void a_padded_varint_is_refused_as_non_canonical() {
+    const auto padded = raw({0x80, 0x00});
+    reader r{padded};
+
+    CHECK(!r.varint_u64().has_value());
+    CHECK(!r.ok());
+    CHECK(r.offset() == 0);
+    CHECK(r.remaining() == 0);
+    CHECK(refused_with(r.refused(), 0, reason::non_canonical, 0, 2));
+}
+
+// Ten groups hold 64 bits only if the tenth holds a single one. Past that the
+// value would wrap, which is how a length check gets walked around.
+void a_varint_past_sixty_four_bits_is_refused() {
+    const auto wrapping =
+        raw({0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02});
+    reader r{wrapping};
+    CHECK(!r.varint_u64().has_value());
+    CHECK(!r.ok());
+    CHECK(r.offset() == 0);
+    CHECK(refused_with(r.refused(), 0, reason::overflow, 0, 10));
+
+    // Eleven bytes are refused at the tenth, which already continued.
+    const auto endless = raw({0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                              0x01});
+    reader eleven{endless};
+    CHECK(!eleven.varint_u64().has_value());
+    CHECK(eleven.offset() == 0);
+    CHECK(refused_with(eleven.refused(), 0, reason::overflow, 0, 10));
+}
+
+// The input ran out mid-varint: a continuation byte promised more and there
+// was no more.
+void a_varint_that_ends_inside_itself_is_short_input() {
+    const auto lone = raw({0x80});
+    reader r{lone};
+    CHECK(!r.varint_u64().has_value());
+    CHECK(!r.ok());
+    CHECK(r.offset() == 0);
+    CHECK(refused_with(r.refused(), 0, reason::short_input, 2, 1));
+
+    const std::span<const std::byte> empty;
+    reader nothing{empty};
+    CHECK(!nothing.varint_u64().has_value());
+    CHECK(refused_with(nothing.refused(), 0, reason::short_input, 1, 0));
+}
+
+// A varint is one field however many bytes it spans, so the refusal names its
+// first byte rather than the byte that proved it wrong.
+void a_refused_varint_names_its_own_first_byte() {
+    const auto data = raw({0x01, 0x80, 0x00});
+    reader r{data};
+
+    CHECK(r.u8() == 1u);
+    CHECK(!r.varint_u64().has_value());
+    CHECK(r.offset() == 1);
+    CHECK(refused_with(r.refused(), 1, reason::non_canonical, 0, 2));
+}
+
+// All or nothing: a varint that does not fit leaves the writer where it was,
+// not with a prefix of itself in the buffer.
+void a_varint_without_room_writes_nothing() {
+    std::array<std::byte, 9> buffer{};
+    writer w{buffer};
+
+    CHECK(!w.varint_u64(UINT64_MAX));
+    CHECK(!w.ok());
+    CHECK(w.written() == 0);
+    CHECK(w.view().empty());
+    CHECK(buffer[0] == std::byte{0});
+    CHECK(refused_with(w.refused(), 0, reason::no_room, 10, 9));
+
+    std::array<std::byte, 2> tight{};
+    writer exact{tight};
+    CHECK(exact.varint_u64(128));
+    CHECK(exact.written() == 2);
+    CHECK(!exact.varint_u64(128));
+    CHECK(exact.written() == 2);
+    CHECK(refused_with(exact.refused(), 2, reason::no_room, 2, 0));
+}
+
 void the_writer_round_trips_what_the_reader_reads() {
     std::array<std::byte, 16> buffer{};
     writer w{buffer};
@@ -380,6 +498,12 @@ int main() {
     expect_end_accepts_a_parse_that_consumed_everything();
     expect_end_refuses_trailing_bytes_and_a_failed_cursor();
     trailing_bytes_are_recorded_with_their_count();
+    varints_round_trip_through_their_exact_bytes();
+    a_padded_varint_is_refused_as_non_canonical();
+    a_varint_past_sixty_four_bits_is_refused();
+    a_varint_that_ends_inside_itself_is_short_input();
+    a_refused_varint_names_its_own_first_byte();
+    a_varint_without_room_writes_nothing();
     the_writer_round_trips_what_the_reader_reads();
     the_writer_refuses_to_overrun_its_buffer();
     the_writer_records_an_overrun_as_no_room();

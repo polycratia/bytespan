@@ -51,6 +51,18 @@ someone to trust.
 `size_t` can wrap; the bounds check is against the real remaining size, so a
 wrapped length cannot become a huge `memcpy`.
 
+**A varint with more than one spelling.** `varint_u64` reads unsigned LEB128 —
+seven bits a byte, low group first — and accepts only the canonical encoding,
+because a value that can be written two ways is a value two parsers can
+disagree about. A tenth byte above `0x01` would set bits past the top of the
+type and is `overflow`; a padded tail, `0x80 0x00` for zero, is
+`non_canonical`. Each byte is judged as it is read, there is no lenient mode,
+and a refusal leaves the cursor at the varint's first byte. Neither reason
+reports two sizes, because no size was the problem: `wanted` is zero and
+`available` counts the bytes examined. The writer emits the minimal encoding
+all or nothing, so a buffer too small leaves `written()` where it stood rather
+than half a varint for someone to read back.
+
 **Bytes nobody asked for.** `expect_end()` is true only when the cursor is
 still `ok()` and sits exactly at the end of the input. Trailing bytes poison it
 like any other failure, and a cursor that already failed is refused too — its
@@ -77,7 +89,8 @@ disagreed:
 ```cpp
 if (const auto why = r.refused()) {        // nullopt while ok()
     why->offset;     // first byte of the field that was refused
-    why->why;        // short_input or trailing_bytes; no_room or too_long when writing
+    why->why;        // short_input, trailing_bytes, overflow or non_canonical
+                     // when reading; no_room or too_long when writing
     why->wanted;     // bytes the field needed
     why->available;  // bytes actually left from that offset
 }
@@ -135,10 +148,10 @@ Early, and small on purpose.
 
 | | |
 |---|---|
-| Reading | `u8`/`u16`/`u32`/`u64` in either byte order, raw spans, skip, length-prefixed payloads, `expect_end` |
+| Reading | `u8`/`u16`/`u32`/`u64` in either byte order, `varint_u64`, raw spans, skip, length-prefixed payloads, `expect_end` |
 | Writing | the same set, bounds-checked, with a view of what was written |
 | Reporting | `refused()`: the first refusal with its offset, reason, and the sizes that disagreed |
-| Not yet | signed integers, varints, floating point, bit-level fields, `std::expected` return type for C++23 users |
+| Not yet | signed integers, floating point, bit-level fields, `std::expected` return type for C++23 users |
 
 ## Development
 

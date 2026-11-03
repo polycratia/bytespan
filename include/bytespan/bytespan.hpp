@@ -16,6 +16,7 @@
 #ifndef BYTESPAN_BYTESPAN_HPP
 #define BYTESPAN_BYTESPAN_HPP
 
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +36,8 @@ enum class reason {
     no_room,         ///< writer: the call needed more room than was left
     trailing_bytes,  ///< reader: expect_end found bytes after the last field
     too_long,        ///< writer: a payload too large to count in its prefix
+    overflow,        ///< reader: a varint whose value does not fit the type
+    non_canonical,   ///< reader: a varint padded past its shortest encoding
 };
 
 /// A refusal as it happened: which field, why, and the two sizes that
@@ -69,6 +72,9 @@ template <typename T>
     const std::size_t limit = std::numeric_limits<std::size_t>::max();
     return a > limit - b ? limit : a + b;
 }
+
+/// Seven bits to a byte: ten groups is the most a 64-bit value can need.
+inline constexpr std::size_t varint_u64_max_bytes = 10;
 
 }  // namespace detail
 
@@ -129,6 +135,39 @@ class reader {
         return read<std::uint64_t>(order);
     }
 
+    /// Unsigned LEB128: seven bits to a byte, low group first, and only the
+    /// canonical encoding. A value that can be spelled two ways is a value two
+    /// parsers can disagree about, so a padded varint is refused rather than
+    /// quietly accepted and there is no lenient mode. Each byte is judged as
+    /// it is read, and a refusal names the varint's first byte.
+    [[nodiscard]] std::optional<std::uint64_t> varint_u64() noexcept {
+        if (!ok()) return std::nullopt;
+        const std::size_t start = offset_;
+        std::uint64_t value = 0;
+        for (std::size_t index = 0;; ++index) {
+            if (offset_ == data_.size()) {
+                return refuse_varint(start, reason::short_input, index + 1,
+                                     data_.size() - start);
+            }
+            const auto group = static_cast<std::uint8_t>(data_[offset_]);
+            ++offset_;
+            // Nine groups carry 63 bits, so a tenth may carry one more; above
+            // 0x01 it sets bits past the top of the type. An eleventh byte
+            // needs a tenth that continued, which is already above 0x01, so
+            // this single test covers that too.
+            if (index == detail::varint_u64_max_bytes - 1 && group > 0x01) {
+                return refuse_varint(start, reason::overflow, 0, offset_ - start);
+            }
+            // A zero group cannot continue, so it ends the varint; anywhere
+            // but first it is padding, and the value had a shorter spelling.
+            if (index > 0 && group == 0x00) {
+                return refuse_varint(start, reason::non_canonical, 0, offset_ - start);
+            }
+            value |= static_cast<std::uint64_t>(group & 0x7Fu) << (7 * index);
+            if ((group & 0x80u) == 0) return value;
+        }
+    }
+
     /// Read a length prefix and then that many bytes — the shape that goes
     /// wrong most often, so it is one call rather than two.
     [[nodiscard]] std::optional<std::span<const std::byte>> length_prefixed_u16(endian order) noexcept {
@@ -142,6 +181,15 @@ class reader {
   private:
     void poison(refusal record) noexcept {
         if (!refusal_) refusal_ = record;
+    }
+
+    /// A varint is one field however many bytes it spans, so a refusal leaves
+    /// the cursor at its first byte the way every other refusal does.
+    std::nullopt_t refuse_varint(std::size_t start, reason why, std::size_t wanted,
+                                 std::size_t available) noexcept {
+        poison({start, why, wanted, available});
+        offset_ = start;
+        return std::nullopt;
     }
 
     bool take(std::size_t n) noexcept {
@@ -235,6 +283,21 @@ class writer {
     bool u16(std::uint16_t value, endian order) noexcept { return put(value, order); }
     bool u32(std::uint32_t value, endian order) noexcept { return put(value, order); }
     bool u64(std::uint64_t value, endian order) noexcept { return put(value, order); }
+
+    /// The minimal encoding the reader accepts, all or nothing: the groups are
+    /// built first and written in one call, so a refusal leaves written() where
+    /// it stood rather than half a varint for someone to read back.
+    bool varint_u64(std::uint64_t value) noexcept {
+        std::array<std::byte, detail::varint_u64_max_bytes> groups{};
+        std::size_t size = 0;
+        do {
+            auto group = static_cast<std::uint8_t>(value & 0x7Fu);
+            value >>= 7;
+            if (value != 0) group = static_cast<std::uint8_t>(group | 0x80u);
+            groups[size++] = static_cast<std::byte>(group);
+        } while (value != 0);
+        return bytes(std::span<const std::byte>(groups).first(size));
+    }
 
     /// Write the payload's size as a prefix and then the payload, mirroring
     /// the reader: one call, because a count written apart from its body is

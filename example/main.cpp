@@ -39,6 +39,8 @@ const char* describe(bytespan::reason why) {
         case bytespan::reason::no_room: return "no room";
         case bytespan::reason::trailing_bytes: return "trailing bytes";
         case bytespan::reason::too_long: return "too long";
+        case bytespan::reason::overflow: return "overflow";
+        case bytespan::reason::non_canonical: return "non canonical";
     }
     return "unknown";
 }
