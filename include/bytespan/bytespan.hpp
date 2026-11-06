@@ -78,18 +78,23 @@ inline constexpr std::size_t varint_u64_max_bytes = 10;
 
 }  // namespace detail
 
-/// A cursor over bytes that cannot be moved past its end.
+/// A cursor over bytes that cannot be moved past its end. Every read is a
+/// constant expression, so a parse of a constexpr input is evaluated by the
+/// compiler, where reaching past the end is an error rather than behaviour.
 class reader {
   public:
     constexpr explicit reader(std::span<const std::byte> data) noexcept : data_(data) {}
 
     /// True while every read so far has succeeded.
-    [[nodiscard]] constexpr bool ok() const noexcept { return !refusal_.has_value(); }
+    [[nodiscard]] constexpr bool ok() const noexcept { return !refused_; }
 
     /// The refusal that poisoned the cursor, nullopt while ok(). It is the
     /// first one: later calls fail as a consequence of it, and recording those
     /// consequences would bury the failure that explains the parse.
-    [[nodiscard]] std::optional<refusal> refused() const noexcept { return refusal_; }
+    [[nodiscard]] constexpr std::optional<refusal> refused() const noexcept {
+        if (!refused_) return std::nullopt;
+        return record_;
+    }
 
     /// Bytes not yet consumed. Zero once the cursor is poisoned, so that a
     /// caller looping on remaining() cannot spin.
@@ -100,19 +105,20 @@ class reader {
     [[nodiscard]] constexpr std::size_t offset() const noexcept { return offset_; }
 
     /// Consume n bytes. Fails, and poisons the cursor, if fewer remain.
-    [[nodiscard]] std::optional<std::span<const std::byte>> bytes(std::size_t n) noexcept {
+    [[nodiscard]] constexpr std::optional<std::span<const std::byte>> bytes(
+        std::size_t n) noexcept {
         if (!take(n)) return std::nullopt;
         return data_.subspan(offset_ - n, n);
     }
 
     /// Skip n bytes without looking at them.
-    bool skip(std::size_t n) noexcept { return take(n); }
+    constexpr bool skip(std::size_t n) noexcept { return take(n); }
 
     /// True only when the parse consumed exactly the input: trailing bytes
     /// poison the cursor, and a cursor that already failed stays refused even
     /// though remaining() reports zero, so a poisoned parse cannot read as
     /// complete. Like skip(), it belongs in the run of reads checked by ok().
-    bool expect_end() noexcept {
+    constexpr bool expect_end() noexcept {
         if (!ok()) return false;
         if (offset_ != data_.size()) {
             poison({offset_, reason::trailing_bytes, 0, data_.size() - offset_});
@@ -121,17 +127,19 @@ class reader {
         return true;
     }
 
-    [[nodiscard]] std::optional<std::uint8_t> u8() noexcept { return read<std::uint8_t>(endian::big); }
+    [[nodiscard]] constexpr std::optional<std::uint8_t> u8() noexcept {
+        return read<std::uint8_t>(endian::big);
+    }
 
-    [[nodiscard]] std::optional<std::uint16_t> u16(endian order) noexcept {
+    [[nodiscard]] constexpr std::optional<std::uint16_t> u16(endian order) noexcept {
         return read<std::uint16_t>(order);
     }
 
-    [[nodiscard]] std::optional<std::uint32_t> u32(endian order) noexcept {
+    [[nodiscard]] constexpr std::optional<std::uint32_t> u32(endian order) noexcept {
         return read<std::uint32_t>(order);
     }
 
-    [[nodiscard]] std::optional<std::uint64_t> u64(endian order) noexcept {
+    [[nodiscard]] constexpr std::optional<std::uint64_t> u64(endian order) noexcept {
         return read<std::uint64_t>(order);
     }
 
@@ -140,7 +148,7 @@ class reader {
     /// parsers can disagree about, so a padded varint is refused rather than
     /// quietly accepted and there is no lenient mode. Each byte is judged as
     /// it is read, and a refusal names the varint's first byte.
-    [[nodiscard]] std::optional<std::uint64_t> varint_u64() noexcept {
+    [[nodiscard]] constexpr std::optional<std::uint64_t> varint_u64() noexcept {
         if (!ok()) return std::nullopt;
         const std::size_t start = offset_;
         std::uint64_t value = 0;
@@ -149,7 +157,7 @@ class reader {
                 return refuse_varint(start, reason::short_input, index + 1,
                                      data_.size() - start);
             }
-            const auto group = static_cast<std::uint8_t>(data_[offset_]);
+            const auto group = std::to_integer<std::uint8_t>(data_[offset_]);
             ++offset_;
             // Nine groups carry 63 bits, so a tenth may carry one more; above
             // 0x01 it sets bits past the top of the type. An eleventh byte
@@ -170,29 +178,34 @@ class reader {
 
     /// Read a length prefix and then that many bytes — the shape that goes
     /// wrong most often, so it is one call rather than two.
-    [[nodiscard]] std::optional<std::span<const std::byte>> length_prefixed_u16(endian order) noexcept {
+    [[nodiscard]] constexpr std::optional<std::span<const std::byte>> length_prefixed_u16(
+        endian order) noexcept {
         return length_prefixed<std::uint16_t>(order);
     }
 
-    [[nodiscard]] std::optional<std::span<const std::byte>> length_prefixed_u32(endian order) noexcept {
+    [[nodiscard]] constexpr std::optional<std::span<const std::byte>> length_prefixed_u32(
+        endian order) noexcept {
         return length_prefixed<std::uint32_t>(order);
     }
 
   private:
-    void poison(refusal record) noexcept {
-        if (!refusal_) refusal_ = record;
+    constexpr void poison(refusal record) noexcept {
+        if (!refused_) {
+            record_ = record;
+            refused_ = true;
+        }
     }
 
     /// A varint is one field however many bytes it spans, so a refusal leaves
     /// the cursor at its first byte the way every other refusal does.
-    std::nullopt_t refuse_varint(std::size_t start, reason why, std::size_t wanted,
-                                 std::size_t available) noexcept {
+    constexpr std::nullopt_t refuse_varint(std::size_t start, reason why, std::size_t wanted,
+                                           std::size_t available) noexcept {
         poison({start, why, wanted, available});
         offset_ = start;
         return std::nullopt;
     }
 
-    bool take(std::size_t n) noexcept {
+    constexpr bool take(std::size_t n) noexcept {
         if (!ok()) return false;
         if (n > data_.size() - offset_) {
             poison({offset_, reason::short_input, n, data_.size() - offset_});
@@ -202,16 +215,26 @@ class reader {
         return true;
     }
 
+    /// The value is assembled from the bytes in the order that was asked for.
+    /// That is both why it works during constant evaluation, where a memcpy
+    /// through an object representation does not, and why the reader never
+    /// consults the host's byte order at all.
     template <typename T>
-    [[nodiscard]] std::optional<T> read(endian order) noexcept {
+    [[nodiscard]] constexpr std::optional<T> read(endian order) noexcept {
         if (!take(sizeof(T))) return std::nullopt;
+        const std::size_t start = offset_ - sizeof(T);
         T value{};
-        std::memcpy(&value, data_.data() + offset_ - sizeof(T), sizeof(T));
-        return fix(value, order);
+        for (std::size_t i = 0; i < sizeof(T); ++i) {
+            const std::size_t shift = 8 * (order == endian::big ? sizeof(T) - 1 - i : i);
+            const auto group = static_cast<T>(std::to_integer<std::uint8_t>(data_[start + i]));
+            value = static_cast<T>(value | static_cast<T>(group << shift));
+        }
+        return value;
     }
 
     template <typename T>
-    [[nodiscard]] std::optional<std::span<const std::byte>> length_prefixed(endian order) noexcept {
+    [[nodiscard]] constexpr std::optional<std::span<const std::byte>> length_prefixed(
+        endian order) noexcept {
         if (!ok()) return std::nullopt;
         const std::size_t start = offset_;
         const auto length = read<T>(order);
@@ -232,20 +255,13 @@ class reader {
         return data_.subspan(offset_ - wanted, wanted);
     }
 
-    template <typename T>
-    static constexpr T fix(T value, endian order) noexcept {
-        if constexpr (sizeof(T) == 1) {
-            return value;
-        } else {
-            const bool host_is_little = std::endian::native == std::endian::little;
-            const bool want_little = order == endian::little;
-            return host_is_little == want_little ? value : detail::swap_bytes(value);
-        }
-    }
-
     std::span<const std::byte> data_;
     std::size_t offset_ = 0;
-    std::optional<refusal> refusal_;
+    // Not a std::optional: assigning to one during constant evaluation only
+    // became valid in a defect report against C++20, and the reader should not
+    // need a compiler new enough to carry that fix.
+    bool refused_ = false;
+    refusal record_{};
 };
 
 /// A cursor that writes, with the same discipline: an overrun fails the writer

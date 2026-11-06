@@ -109,6 +109,21 @@ with the room that was left, while a payload too big to count in its prefix is
 `too_long` with the prefix maximum — 65535 or 4294967295 — as what was
 available, because room was never the problem.
 
+## What the compiler checks
+
+The reader is `constexpr` throughout, so a parse of a `constexpr` input is
+evaluated while the file is being compiled. Core-language undefined behaviour
+cannot be reached during constant evaluation: a read that walked off the end of
+the span would be a compile error instead, on every compiler, with or without
+sanitizers. The `static_assert` block at the top of `tests/test_bytespan.cpp`
+uses that — a truncated `u32`, a length prefix that lies, an honest one, a
+trailing byte, a padded varint — and it covers exactly those inputs, not all
+inputs. The runtime tests still do the rest.
+
+An integer is assembled from its bytes in the order that was asked for, rather
+than copied in and swapped, so the reader never consults the host's byte order
+at all.
+
 ## Use
 
 Header-only, C++20, no dependencies, no allocation, no exceptions. Copy
@@ -138,8 +153,8 @@ descriptors. It is a cursor with bounds checks, and it stops there.
 `-fsanitize=address,undefined`, because a bounds-checking library that is only
 checked by its own assertions has proved nothing.
 
-**Not `std::byteswap`.** That is C++23; this reverses the bytes by hand to stay
-at C++20, where most projects that need this actually are. Every compiler
+**Not `std::byteswap`.** That is C++23; the writer reverses the bytes by hand to
+stay at C++20, where most projects that need this actually are. Every compiler
 recognises the pattern.
 
 ## Status
@@ -148,10 +163,11 @@ Early, and small on purpose.
 
 | | |
 |---|---|
-| Reading | `u8`/`u16`/`u32`/`u64` in either byte order, `varint_u64`, raw spans, skip, length-prefixed payloads, `expect_end` |
+| Reading | `u8`/`u16`/`u32`/`u64` in either byte order, `varint_u64`, raw spans, skip, length-prefixed payloads, `expect_end` — all `constexpr` |
 | Writing | the same set, bounds-checked, with a view of what was written |
 | Reporting | `refused()`: the first refusal with its offset, reason, and the sizes that disagreed |
-| Not yet | signed integers, floating point, bit-level fields, `std::expected` return type for C++23 users |
+| Checking | runtime tests under ASan and UBSan, plus a `static_assert` block the compiler evaluates |
+| Not yet | signed integers, floating point, bit-level fields, a `constexpr` writer, `std::expected` return type for C++23 users |
 
 ## Development
 

@@ -12,6 +12,83 @@
 
 using namespace bytespan;
 
+// Constant evaluation is where core-language undefined behaviour cannot be
+// reached: a read past the end of the span makes this block fail to compile,
+// on every compiler, with or without sanitizers. It covers the inputs written
+// here and no others, which is why the runtime tests below still run under
+// AddressSanitizer and UndefinedBehaviorSanitizer.
+namespace compile_time {
+
+constexpr bool a_truncated_u32_is_refused_at_offset_zero() {
+    constexpr std::array<std::byte, 2> input{std::byte{0x01}, std::byte{0x02}};
+    reader r{input};
+
+    if (r.u32(endian::big).has_value()) return false;
+    if (r.ok() || r.offset() != 0 || r.remaining() != 0) return false;
+
+    const auto why = r.refused();
+    return why.has_value() && why->offset == 0 && why->why == reason::short_input &&
+           why->wanted == 4 && why->available == 2;
+}
+
+constexpr bool a_lying_u16_prefix_is_refused_at_offset_zero() {
+    constexpr std::array<std::byte, 4> input{std::byte{0xFF}, std::byte{0xFF},
+                                             std::byte{0xAA}, std::byte{0xBB}};
+    reader r{input};
+
+    if (r.length_prefixed_u16(endian::big).has_value()) return false;
+    if (r.ok() || r.offset() != 0) return false;
+
+    const auto why = r.refused();
+    return why.has_value() && why->offset == 0 && why->why == reason::short_input &&
+           why->wanted == 2 + 0xFFFF && why->available == 4;
+}
+
+constexpr bool an_honest_u16_prefix_yields_its_payload() {
+    constexpr std::array<std::byte, 4> input{std::byte{0x00}, std::byte{0x02},
+                                             std::byte{0xAA}, std::byte{0xBB}};
+    reader r{input};
+
+    const auto payload = r.length_prefixed_u16(endian::big);
+    if (!payload.has_value() || payload->size() != 2) return false;
+    if ((*payload)[0] != std::byte{0xAA} || (*payload)[1] != std::byte{0xBB}) return false;
+
+    return r.expect_end() && r.ok();
+}
+
+constexpr bool a_trailing_byte_fails_expect_end() {
+    constexpr std::array<std::byte, 3> input{std::byte{0x01}, std::byte{0x02},
+                                             std::byte{0x03}};
+    reader r{input};
+
+    if (r.u16(endian::big) != 0x0102u) return false;
+    if (r.expect_end()) return false;
+
+    const auto why = r.refused();
+    return !r.ok() && why.has_value() && why->offset == 2 &&
+           why->why == reason::trailing_bytes && why->wanted == 0 && why->available == 1;
+}
+
+constexpr bool a_padded_varint_is_non_canonical() {
+    constexpr std::array<std::byte, 2> input{std::byte{0x80}, std::byte{0x00}};
+    reader r{input};
+
+    if (r.varint_u64().has_value()) return false;
+    if (r.ok() || r.offset() != 0) return false;
+
+    const auto why = r.refused();
+    return why.has_value() && why->offset == 0 && why->why == reason::non_canonical &&
+           why->wanted == 0 && why->available == 2;
+}
+
+static_assert(a_truncated_u32_is_refused_at_offset_zero());
+static_assert(a_lying_u16_prefix_is_refused_at_offset_zero());
+static_assert(an_honest_u16_prefix_yields_its_payload());
+static_assert(a_trailing_byte_fails_expect_end());
+static_assert(a_padded_varint_is_non_canonical());
+
+}  // namespace compile_time
+
 namespace {
 
 std::vector<std::byte> raw(std::initializer_list<int> values) {
