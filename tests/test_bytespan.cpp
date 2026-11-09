@@ -558,6 +558,173 @@ void an_honest_length_prefixed_write_round_trips() {
     }
 }
 
+// Formats nest: an extension block whose length covers a TLV carrying its own.
+// Neither count is known when it has to be written, so both are reserved and
+// patched afterwards, and the reader reads them back as ordinary prefixes.
+void nested_length_slots_round_trip_through_the_reader() {
+    const auto payload = raw({0xAA, 0xBB, 0xCC});
+    std::array<std::byte, 32> buffer{};
+    writer w{buffer};
+
+    const auto block = w.open_u16();
+    CHECK(block.has_value());
+    CHECK(w.u8(0x0A));
+    const auto body = w.open_u16();
+    CHECK(body.has_value());
+    CHECK(w.bytes(payload));
+    CHECK(w.close(*body, endian::big));
+    CHECK(w.close(*block, endian::big));
+    CHECK(w.ok());
+    CHECK(w.written() == 8);
+
+    const auto expected = raw({0x00, 0x06, 0x0A, 0x00, 0x03, 0xAA, 0xBB, 0xCC});
+    CHECK(std::equal(w.view().begin(), w.view().end(), expected.begin()));
+
+    reader r{w.view()};
+    const auto block_bytes = r.length_prefixed_u16(endian::big);
+    CHECK(block_bytes.has_value());
+    CHECK(block_bytes->size() == 6);
+    CHECK(r.expect_end());
+
+    reader inner{*block_bytes};
+    CHECK(inner.u8() == 0x0Au);
+    const auto body_bytes = inner.length_prefixed_u16(endian::big);
+    CHECK(body_bytes.has_value());
+    CHECK(body_bytes->size() == 3);
+    CHECK(std::equal(body_bytes->begin(), body_bytes->end(), payload.begin()));
+    CHECK(inner.expect_end());
+}
+
+void a_u32_slot_is_patched_in_either_order() {
+    const auto payload = raw({0xAA, 0xBB, 0xCC});
+
+    for (const endian order : {endian::big, endian::little}) {
+        std::array<std::byte, 16> buffer{};
+        writer w{buffer};
+
+        const auto slot = w.open_u32();
+        CHECK(slot.has_value());
+        CHECK(w.bytes(payload));
+        CHECK(w.close(*slot, order));
+        CHECK(w.ok());
+        CHECK(w.written() == 7);
+
+        reader r{w.view()};
+        const auto body = r.length_prefixed_u32(order);
+        CHECK(body.has_value());
+        CHECK(body->size() == 3);
+        CHECK(std::equal(body->begin(), body->end(), payload.begin()));
+        CHECK(r.expect_end());
+    }
+}
+
+// The field cannot hold the count the body turned out to need. Truncating it
+// would write a block that lies about its own length.
+void a_body_too_long_for_its_slot_is_refused() {
+    std::vector<std::byte> buffer(80000);
+    const std::vector<std::byte> body(70000, std::byte{0xAB});
+
+    writer w{buffer};
+    const auto slot = w.open_u16();
+    CHECK(slot.has_value());
+    CHECK(w.bytes(body));
+    CHECK(!w.close(*slot, endian::big));
+    CHECK(!w.ok());
+    CHECK(refused_with(w.refused(), 0, reason::too_long, 70000, 0xFFFF));
+    // The field keeps the zeros it was reserved with.
+    CHECK(buffer[0] == std::byte{0});
+    CHECK(buffer[1] == std::byte{0});
+}
+
+// Closing the outer block first would patch it with a length that stops short
+// of the inner one, which is a record no reader can make sense of.
+void closing_a_slot_out_of_order_is_refused() {
+    std::array<std::byte, 16> buffer{};
+    writer w{buffer};
+
+    const auto outer = w.open_u16();
+    const auto inner = w.open_u16();
+    CHECK(outer.has_value());
+    CHECK(inner.has_value());
+    CHECK(w.u8(0xAA));
+
+    CHECK(!w.close(*outer, endian::big));
+    CHECK(!w.ok());
+    CHECK(refused_with(w.refused(), 5, reason::bad_slot, 0, 0));
+    // Sticky: the inner one cannot be closed afterwards either.
+    CHECK(!w.close(*inner, endian::big));
+    CHECK(refused_with(w.refused(), 5, reason::bad_slot, 0, 0));
+}
+
+// A slot is spent by its close. Closing it again would patch a field with a
+// count of bytes written after the block it belonged to.
+void closing_a_slot_twice_is_refused() {
+    std::array<std::byte, 16> buffer{};
+    writer w{buffer};
+
+    const auto slot = w.open_u16();
+    CHECK(slot.has_value());
+    CHECK(w.u16(0xBEEF, endian::big));
+    CHECK(w.close(*slot, endian::big));
+    CHECK(w.ok());
+
+    CHECK(!w.close(*slot, endian::big));
+    CHECK(!w.ok());
+    CHECK(refused_with(w.refused(), 4, reason::bad_slot, 0, 0));
+    // The length patched the first time survived the refusal.
+    CHECK(buffer[0] == std::byte{0x00});
+    CHECK(buffer[1] == std::byte{0x02});
+}
+
+// Two writers, two buffers: a slot carries the data pointer it was opened on,
+// so it cannot be closed over someone else's bytes.
+void a_slot_from_another_buffer_is_refused() {
+    std::array<std::byte, 16> first{};
+    std::array<std::byte, 16> second{};
+    writer a{first};
+    writer b{second};
+
+    const auto slot = a.open_u16();
+    CHECK(slot.has_value());
+    CHECK(b.u8(0x01));
+
+    CHECK(!b.close(*slot, endian::big));
+    CHECK(!b.ok());
+    CHECK(refused_with(b.refused(), 1, reason::bad_slot, 0, 0));
+    CHECK(a.ok());
+    CHECK(second[0] == std::byte{0x01});
+}
+
+void a_slot_that_does_not_fit_is_refused_as_no_room() {
+    std::array<std::byte, 1> buffer{};
+    writer w{buffer};
+
+    CHECK(!w.open_u16().has_value());
+    CHECK(!w.ok());
+    CHECK(w.written() == 0);
+    CHECK(refused_with(w.refused(), 0, reason::no_room, 2, 1));
+    // And a poisoned writer hands out no slots at all.
+    CHECK(!w.open_u32().has_value());
+    CHECK(refused_with(w.refused(), 0, reason::no_room, 2, 1));
+}
+
+// view() makes no promise about open slots: a field whose close never came is
+// still the zeros open reserved, even over a buffer that arrived dirty.
+void an_unclosed_slot_stays_zero_in_the_view() {
+    std::array<std::byte, 8> buffer{};
+    buffer.fill(std::byte{0xFF});
+
+    writer w{buffer};
+    const auto slot = w.open_u16();
+    CHECK(slot.has_value());
+    CHECK(w.u8(0xAA));
+    CHECK(w.ok());
+
+    const auto expected = raw({0x00, 0x00, 0xAA});
+    CHECK(w.view().size() == 3);
+    CHECK(std::equal(w.view().begin(), w.view().end(), expected.begin()));
+}
+
 }  // namespace
 
 int main() {
@@ -588,5 +755,13 @@ int main() {
     a_payload_too_large_for_its_prefix_is_refused();
     a_prefix_without_room_for_its_body_writes_nothing();
     an_honest_length_prefixed_write_round_trips();
+    nested_length_slots_round_trip_through_the_reader();
+    a_u32_slot_is_patched_in_either_order();
+    a_body_too_long_for_its_slot_is_refused();
+    closing_a_slot_out_of_order_is_refused();
+    closing_a_slot_twice_is_refused();
+    a_slot_from_another_buffer_is_refused();
+    a_slot_that_does_not_fit_is_refused_as_no_room();
+    an_unclosed_slot_stays_zero_in_the_view();
     return harness::report("bytespan");
 }

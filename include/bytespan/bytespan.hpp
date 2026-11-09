@@ -38,6 +38,8 @@ enum class reason {
     too_long,        ///< writer: a payload too large to count in its prefix
     overflow,        ///< reader: a varint whose value does not fit the type
     non_canonical,   ///< reader: a varint padded past its shortest encoding
+    bad_slot,        ///< writer: a length slot closed out of order, closed
+                     ///< twice, or opened on another buffer
 };
 
 /// A refusal as it happened: which field, why, and the two sizes that
@@ -264,6 +266,17 @@ class reader {
     refusal record_{};
 };
 
+/// A length field reserved by writer::open_u16 or writer::open_u32 and spent
+/// by writer::close: the field's offset, its width, the buffer it was reserved
+/// in, and the offset of the slot that was innermost when it opened. A plain
+/// value, so nesting is a chain of locals rather than a stack the writer owns.
+struct length_slot {
+    std::size_t offset;
+    std::size_t width;
+    const std::byte* data;
+    std::optional<std::size_t> parent;
+};
+
 /// A cursor that writes, with the same discipline: an overrun fails the writer
 /// instead of the process.
 class writer {
@@ -281,7 +294,10 @@ class writer {
         return ok() ? out_.size() - offset_ : 0;
     }
 
-    /// What has been written so far, for handing to a socket.
+    /// What has been written so far, for handing to a socket. Open slots are
+    /// not checked: a length field whose close never came is still the zeros
+    /// open reserved it with, because the writer cannot tell a caller who is
+    /// finished from one who is not.
     [[nodiscard]] constexpr std::span<const std::byte> view() const noexcept {
         return out_.subspan(0, offset_);
     }
@@ -327,6 +343,52 @@ class writer {
         return length_prefixed<std::uint32_t>(payload, order);
     }
 
+    /// Reserve a zeroed length field for a body whose size is not known yet —
+    /// the shape every nested format has, a block whose count covers a block
+    /// that carries its own. Nullopt with the writer poisoned as no_room when
+    /// the field does not fit, and nullopt on a writer that already failed.
+    [[nodiscard]] std::optional<length_slot> open_u16() noexcept {
+        return open<std::uint16_t>();
+    }
+
+    [[nodiscard]] std::optional<length_slot> open_u32() noexcept {
+        return open<std::uint32_t>();
+    }
+
+    /// Write the bytes written since the field as the body's length, and make
+    /// the slot's parent the innermost open slot again. Refusals poison the
+    /// writer: a body longer than the field can count is too_long and leaves
+    /// the field's zeros alone, while a slot that is not the innermost open one
+    /// — closed out of order, or closed twice — or that was opened on another
+    /// buffer is bad_slot. A bad_slot refusal is recorded at the offset the
+    /// writer had reached, since such a slot's own offset may name a position
+    /// in someone else's buffer.
+    bool close(const length_slot& slot, endian order) noexcept {
+        if (!ok()) return false;
+        // The innermost offset is enough to identify the slot: offsets only
+        // grow, so no two slots of one writer can ever share one.
+        if (slot.data != out_.data() || innermost_ != slot.offset) {
+            poison({offset_, reason::bad_slot, 0, 0});
+            return false;
+        }
+        const bool narrow = slot.width == sizeof(std::uint16_t);
+        const std::size_t body = offset_ - (slot.offset + slot.width);
+        const std::size_t limit =
+            narrow ? static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max())
+                   : static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max());
+        if (body > limit) {
+            poison({slot.offset, reason::too_long, body, limit});
+            return false;
+        }
+        if (narrow) {
+            store(slot.offset, static_cast<std::uint16_t>(body), order);
+        } else {
+            store(slot.offset, static_cast<std::uint32_t>(body), order);
+        }
+        innermost_ = slot.parent;
+        return true;
+    }
+
   private:
     void poison(refusal record) noexcept {
         if (!refusal_) refusal_ = record;
@@ -343,15 +405,32 @@ class writer {
     }
 
     template <typename T>
-    bool put(T value, endian order) noexcept {
-        if (!take(sizeof(T))) return false;
+    void store(std::size_t at, T value, endian order) noexcept {
         if constexpr (sizeof(T) > 1) {
             const bool host_is_little = std::endian::native == std::endian::little;
             const bool want_little = order == endian::little;
             if (host_is_little != want_little) value = detail::swap_bytes(value);
         }
-        std::memcpy(out_.data() + offset_ - sizeof(T), &value, sizeof(T));
+        std::memcpy(out_.data() + at, &value, sizeof(T));
+    }
+
+    template <typename T>
+    bool put(T value, endian order) noexcept {
+        if (!take(sizeof(T))) return false;
+        store(offset_ - sizeof(T), value, order);
         return true;
+    }
+
+    template <typename T>
+    std::optional<length_slot> open() noexcept {
+        const std::size_t at = offset_;
+        if (!take(sizeof(T))) return std::nullopt;
+        // The caller's buffer need not have arrived zeroed, and an unclosed
+        // field has to read as zero rather than as whatever was there.
+        for (std::size_t i = 0; i < sizeof(T); ++i) out_[at + i] = std::byte{0};
+        const length_slot slot{at, sizeof(T), out_.data(), innermost_};
+        innermost_ = at;
+        return slot;
     }
 
     template <typename T>
@@ -380,6 +459,9 @@ class writer {
     std::span<std::byte> out_;
     std::size_t offset_ = 0;
     std::optional<refusal> refusal_;
+    // Only the innermost open slot, because each slot carries its own parent:
+    // nesting needs no allocation and has no fixed depth.
+    std::optional<std::size_t> innermost_;
 };
 
 }  // namespace bytespan

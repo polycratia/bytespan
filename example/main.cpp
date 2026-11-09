@@ -41,6 +41,7 @@ const char* describe(bytespan::reason why) {
         case bytespan::reason::too_long: return "too long";
         case bytespan::reason::overflow: return "overflow";
         case bytespan::reason::non_canonical: return "non canonical";
+        case bytespan::reason::bad_slot: return "bad slot";
     }
     return "unknown";
 }
