@@ -47,6 +47,33 @@ fails the writer instead of truncating the count, and prefix and body are
 reserved in one bounds check — a refusal never leaves a lone length behind for
 someone to trust.
 
+**A length field closed out of order.** When the size is not known until the
+body has been written — the shape every nested format has, a block whose count
+covers a block that carries its own — `open_u16` and `open_u32` reserve a
+zeroed field and hand back a `length_slot`, and `close` back-patches it with
+the bytes written since:
+
+```cpp
+const auto block = w.open_u16();          // nullopt, writer poisoned, if it does not fit
+w.u8(0x0A);
+const auto body = w.open_u16();
+w.bytes(payload);
+w.close(*body, bytespan::endian::big);    // innermost first
+w.close(*block, bytespan::endian::big);
+```
+
+A slot is a plain value — the field's offset, its width, the buffer it was
+reserved in, and the slot that was innermost when it opened — so nesting is a
+chain of locals and needs no allocation and has no fixed depth. The writer
+remembers only the innermost offset, which is enough to identify a slot because
+offsets only grow and no two slots of one writer can share one. A close that
+does not name that slot is `bad_slot`: an outer block closed before the inner
+one, the same slot closed twice, or a slot opened on another buffer. A body too
+large for the field to count is `too_long` and leaves the field's zeros alone.
+`view()` makes no promise about open slots — a field whose close never came is
+still the zeros `open` reserved it with, because the writer cannot tell a caller
+who is finished from one who is not.
+
 **An integer overflow turning into a read.** A 32-bit length on a 32-bit
 `size_t` can wrap; the bounds check is against the real remaining size, so a
 wrapped length cannot become a huge `memcpy`.
@@ -90,7 +117,7 @@ disagreed:
 if (const auto why = r.refused()) {        // nullopt while ok()
     why->offset;     // first byte of the field that was refused
     why->why;        // short_input, trailing_bytes, overflow or non_canonical
-                     // when reading; no_room or too_long when writing
+                     // when reading; no_room, too_long or bad_slot when writing
     why->wanted;     // bytes the field needed
     why->available;  // bytes actually left from that offset
 }
@@ -107,7 +134,9 @@ refused length-prefixed read reports the offset of the prefix and `prefix width
 input says it wanted 65537 and had 4. On the writer, an overrun is `no_room`
 with the room that was left, while a payload too big to count in its prefix is
 `too_long` with the prefix maximum — 65535 or 4294967295 — as what was
-available, because room was never the problem.
+available, because room was never the problem. A `bad_slot` refusal reports no
+sizes at all and names the offset the writer had reached, since the slot's own
+offset may name a position in someone else's buffer.
 
 ## What the compiler checks
 
@@ -164,7 +193,7 @@ Early, and small on purpose.
 | | |
 |---|---|
 | Reading | `u8`/`u16`/`u32`/`u64` in either byte order, `varint_u64`, raw spans, skip, length-prefixed payloads, `expect_end` — all `constexpr` |
-| Writing | the same set, bounds-checked, with a view of what was written |
+| Writing | the same set, bounds-checked, plus length slots reserved and back-patched for bodies whose size is not known yet, with a view of what was written |
 | Reporting | `refused()`: the first refusal with its offset, reason, and the sizes that disagreed |
 | Checking | runtime tests under ASan and UBSan, plus a `static_assert` block the compiler evaluates |
 | Not yet | signed integers, floating point, bit-level fields, a `constexpr` writer, `std::expected` return type for C++23 users |
