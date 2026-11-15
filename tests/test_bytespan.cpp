@@ -4,8 +4,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "harness.hpp"
@@ -725,6 +727,176 @@ void an_unclosed_slot_stays_zero_in_the_view() {
     CHECK(std::equal(w.view().begin(), w.view().end(), expected.begin()));
 }
 
+// The tests above each name one behaviour on an input chosen to provoke it.
+// The invariants that let a parser check ok() once at the end are not about a
+// single call, though: they are about a run of them, and they have to hold for
+// runs nobody thought to write down. Three calls is the shortest run where a
+// refusal can still be followed by more than one call, and the reader has few
+// enough calls that every sequence of three can simply be tried.
+namespace sweep {
+
+struct outcome {
+    bool succeeded;
+    bool has_span;
+    std::span<const std::byte> span;
+};
+
+outcome plain(bool succeeded) { return {succeeded, false, {}}; }
+
+outcome spanned(const std::optional<std::span<const std::byte>>& result) {
+    if (!result) return {false, false, {}};
+    return {true, true, *result};
+}
+
+struct call {
+    const char* name;
+    outcome (*invoke)(reader&, std::size_t);
+    std::size_t argument;
+};
+
+const call calls[] = {
+    {"u8", [](reader& r, std::size_t) { return plain(r.u8().has_value()); }, 0},
+    {"u16", [](reader& r, std::size_t) { return plain(r.u16(endian::big).has_value()); },
+     0},
+    {"u32", [](reader& r, std::size_t) { return plain(r.u32(endian::big).has_value()); },
+     0},
+    {"u64", [](reader& r, std::size_t) { return plain(r.u64(endian::big).has_value()); },
+     0},
+    {"skip(0)", [](reader& r, std::size_t n) { return plain(r.skip(n)); }, 0},
+    {"skip(1)", [](reader& r, std::size_t n) { return plain(r.skip(n)); }, 1},
+    {"skip(2)", [](reader& r, std::size_t n) { return plain(r.skip(n)); }, 2},
+    {"skip(3)", [](reader& r, std::size_t n) { return plain(r.skip(n)); }, 3},
+    {"bytes(0)", [](reader& r, std::size_t n) { return spanned(r.bytes(n)); }, 0},
+    {"bytes(1)", [](reader& r, std::size_t n) { return spanned(r.bytes(n)); }, 1},
+    {"bytes(2)", [](reader& r, std::size_t n) { return spanned(r.bytes(n)); }, 2},
+    {"bytes(3)", [](reader& r, std::size_t n) { return spanned(r.bytes(n)); }, 3},
+    {"length_prefixed_u16",
+     [](reader& r, std::size_t) { return spanned(r.length_prefixed_u16(endian::big)); }, 0},
+    {"length_prefixed_u32",
+     [](reader& r, std::size_t) { return spanned(r.length_prefixed_u32(endian::big)); }, 0},
+    {"varint_u64", [](reader& r, std::size_t) { return plain(r.varint_u64().has_value()); },
+     0},
+    {"expect_end", [](reader& r, std::size_t) { return plain(r.expect_end()); }, 0},
+};
+
+struct shape {
+    const char* name;
+    std::byte (*byte_at)(std::size_t);
+};
+
+// Ascending bytes keep every prefix and varint honest; alternating 0xFF/0x80
+// makes every prefix claim far more than is there and every varint continue
+// until the input runs out.
+const shape shapes[] = {
+    {"ascending", [](std::size_t i) { return static_cast<std::byte>(i); }},
+    {"alternating 0xFF/0x80",
+     [](std::size_t i) { return static_cast<std::byte>(i % 2 == 0 ? 0xFF : 0x80); }},
+};
+
+// std::less over pointers is a total order whatever they point at, so this is
+// defined even for the empty input, where the span carries no object at all.
+bool inside(std::span<const std::byte> part, std::span<const std::byte> whole) {
+    const std::less<const std::byte*> before;
+    if (before(part.data(), whole.data())) return false;
+    return !before(whole.data() + whole.size(), part.data() + part.size());
+}
+
+bool same_refusal(const std::optional<refusal>& record, const refusal& kept) {
+    return record.has_value() && record->offset == kept.offset && record->why == kept.why &&
+           record->wanted == kept.wanted && record->available == kept.available;
+}
+
+std::string describe(const char* broke, const shape& form, std::size_t length,
+                     const call& first, const call& second, const call& third) {
+    std::string out = broke;
+    out += ": ";
+    out += form.name;
+    out += " length ";
+    out += std::to_string(length);
+    out += ", ";
+    out += first.name;
+    out += " then ";
+    out += second.name;
+    out += " then ";
+    out += third.name;
+    return out;
+}
+
+void every_short_call_sequence_keeps_the_invariants() {
+    for (const shape& form : shapes) {
+        for (std::size_t length = 0; length <= 6; ++length) {
+            std::vector<std::byte> storage;
+            storage.reserve(length);
+            for (std::size_t i = 0; i < length; ++i) storage.push_back(form.byte_at(i));
+            const std::span<const std::byte> input{storage};
+
+            for (const call& first : calls) {
+                for (const call& second : calls) {
+                    for (const call& third : calls) {
+                        const call* const steps[] = {&first, &second, &third};
+                        reader r{input};
+                        bool poisoned = false;
+                        std::size_t frozen_offset = 0;
+                        refusal kept{};
+                        const char* broke = nullptr;
+
+                        for (const call* step : steps) {
+                            const std::size_t before = r.offset();
+                            const outcome result = step->invoke(r, step->argument);
+
+                            if (poisoned) {
+                                if (result.succeeded) {
+                                    broke = "a refused cursor let a later call succeed";
+                                } else if (r.offset() != frozen_offset) {
+                                    broke = "a refused cursor moved";
+                                } else if (!same_refusal(r.refused(), kept)) {
+                                    broke = "a refused cursor rewrote its refusal";
+                                }
+                            }
+                            if (!broke && result.succeeded && !r.ok()) {
+                                broke = "a call succeeded on a cursor that is not ok";
+                            }
+                            if (!broke && !result.succeeded && r.ok()) {
+                                broke = "a failed call left the cursor unpoisoned";
+                            }
+                            if (!broke && r.offset() < before) {
+                                broke = "the offset went backwards";
+                            }
+                            if (!broke && !result.succeeded && r.offset() != before) {
+                                broke = "a refused call moved the offset";
+                            }
+                            if (!broke && r.ok() &&
+                                r.offset() + r.remaining() != input.size()) {
+                                broke = "offset and remaining stopped covering the input";
+                            }
+                            if (!broke && result.has_span && !inside(result.span, input)) {
+                                broke = "a returned span left the input";
+                            }
+                            if (broke) break;
+
+                            if (!poisoned && !r.ok()) {
+                                poisoned = true;
+                                frozen_offset = r.offset();
+                                kept = *r.refused();
+                            }
+                        }
+
+                        const std::string label =
+                            broke ? describe(broke, form, length, first, second, third)
+                                  : std::string{};
+                        harness::check(broke == nullptr, label, __FILE__, __LINE__);
+                        // One violation is enough to work from, and the rest of
+                        // the sweep would bury it.
+                        if (broke) return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+}  // namespace sweep
+
 }  // namespace
 
 int main() {
@@ -763,5 +935,6 @@ int main() {
     a_slot_from_another_buffer_is_refused();
     a_slot_that_does_not_fit_is_refused_as_no_room();
     an_unclosed_slot_stays_zero_in_the_view();
+    sweep::every_short_call_sequence_keeps_the_invariants();
     return harness::report("bytespan");
 }
