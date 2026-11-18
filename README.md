@@ -82,19 +82,22 @@ wrapped length cannot become a huge `memcpy`.
 seven bits a byte, low group first — and accepts only the canonical encoding,
 because a value that can be written two ways is a value two parsers can
 disagree about. A tenth byte above `0x01` would set bits past the top of the
-type and is `overflow`; a padded tail, `0x80 0x00` for zero, is
+type and is `overflow`, and an eleventh byte needs a tenth that continued, so
+it is caught by the same test; a padded tail, `0x80 0x00` for zero, is
 `non_canonical`. Each byte is judged as it is read, there is no lenient mode,
 and a refusal leaves the cursor at the varint's first byte. Neither reason
 reports two sizes, because no size was the problem: `wanted` is zero and
-`available` counts the bytes examined. The writer emits the minimal encoding
-all or nothing, so a buffer too small leaves `written()` where it stood rather
-than half a varint for someone to read back.
+`available` counts the bytes examined. A varint the input ends inside is
+ordinary `short_input`, wanting one group more than it had seen. The writer
+emits the minimal encoding all or nothing, so a buffer too small leaves
+`written()` where it stood rather than half a varint for someone to read back.
 
 **Bytes nobody asked for.** `expect_end()` is true only when the cursor is
 still `ok()` and sits exactly at the end of the input. Trailing bytes poison it
-like any other failure, and a cursor that already failed is refused too — its
-`remaining()` is zero for the opposite reason. It joins the run of reads and is
-covered by the same single `ok()`:
+like any other failure — `trailing_bytes`, with the count of what was left over
+as `available` — and a cursor that already failed is refused too, keeping its
+own earlier refusal, because its `remaining()` is zero for the opposite reason.
+It joins the run of reads and is covered by the same single `ok()`:
 
 ```cpp
 const auto type    = r.u8();
@@ -138,6 +141,49 @@ available, because room was never the problem. A `bad_slot` refusal reports no
 sizes at all and names the offset the writer had reached, since the slot's own
 offset may name a position in someone else's buffer.
 
+## Where the cursor stops
+
+A refusal is a position as much as a reason. `offset()` and `refused()->offset`
+agree, and both name the **first byte of the field that was refused**: the
+prefix for a length-prefixed read, the first group for a varint, the first byte
+of the integer for a plain `u32`. Never a position inside the field. A
+length-prefixed read that got its count and then found the payload short rewinds
+to the prefix, so the offset names the field rather than the point at which the
+lie became visible — `expect_end` is the one refusal with no field of its own,
+and it reports the first byte nobody asked for.
+
+```cpp
+const auto input = raw({0x16, 0x03, 0x03, 0xFF, 0xFF, 0xAA});
+bytespan::reader r{input};
+
+const auto type    = r.u8();                                       // 0x16
+const auto version = r.u16(bytespan::endian::big);                  // 0x0303
+const auto payload = r.length_prefixed_u16(bytespan::endian::big);  // refused
+
+const auto why = *r.refused();
+std::printf("refused at %zu: wanted %zu, had %zu\n", why.offset, why.wanted,
+            why.available);
+// refused at 3: wanted 65537, had 3
+
+r.offset();     // 3 — the prefix, not the two bytes of it that were read
+r.remaining();  // 0
+```
+
+And it stays there. The cursor is poisoned for good: every later call fails,
+`remaining()` is zero, the record keeps that first refusal, and `offset()` never
+moves again. A refused parse has one position and one explanation for as long as
+the reader exists.
+
+**Why it never resumes.** There is no `retry()` and no way to feed the reader
+more bytes. A parser that receives the rest of the record builds a new reader
+over the whole record and parses it from the start. That is deliberate: resuming
+on partial input is precisely where length checks get skipped, because a cursor
+that remembers it was halfway through a field has to trust the half it already
+read — the declared length, the groups of a varint — against bytes that had not
+arrived when it was checked. Reassembling a stream into records is the caller's
+job, and framing is outside this library's scope; a reader is a cursor over a
+buffer that is all there.
+
 ## What the compiler checks
 
 The reader is `constexpr` throughout, so a parse of a `constexpr` input is
@@ -178,6 +224,10 @@ instead of the process, and stays failed.
 **Not a serialisation framework.** No schemas, no code generation, no field
 descriptors. It is a cursor with bounds checks, and it stops there.
 
+**Not a streaming parser.** A reader is given the bytes it will ever have. A
+refusal is final rather than a request for more, and deframing a socket into
+records happens above this library, not inside it.
+
 **Not a substitute for the sanitizers.** The tests run under
 `-fsanitize=address,undefined`, because a bounds-checking library that is only
 checked by its own assertions has proved nothing.
@@ -192,10 +242,12 @@ Early, and small on purpose.
 
 | | |
 |---|---|
-| Reading | `u8`/`u16`/`u32`/`u64` in either byte order, `varint_u64`, raw spans, skip, length-prefixed payloads, `expect_end` — all `constexpr` |
-| Writing | the same set, bounds-checked, plus length slots reserved and back-patched for bodies whose size is not known yet, with a view of what was written |
-| Reporting | `refused()`: the first refusal with its offset, reason, and the sizes that disagreed |
-| Checking | runtime tests under ASan and UBSan, plus a `static_assert` block the compiler evaluates |
+| Reading | `u8`/`u16`/`u32`/`u64` in either byte order, raw spans, `skip`, length-prefixed payloads, canonical `varint_u64`, `expect_end` — all `constexpr` |
+| Writing | the same set, bounds-checked, with a prefix and its payload written in one call, plus length slots reserved and back-patched for bodies whose size is not known yet, and a view of what was written |
+| Refusing | reading: short input, trailing bytes, varints that are non-canonical or overflow 64 bits. Writing: no room, a payload too long to count in its prefix or slot, a slot closed out of order, twice, or on another buffer |
+| Reporting | `refused()`: the first refusal, with the offset of the field it refused, the reason, and the sizes that disagreed |
+| Resuming | not a feature — a refused cursor stays refused, and more bytes mean a new reader over the whole record |
+| Checking | runtime tests under ASan and UBSan, a sweep over every three-call sequence of reader calls, and a `static_assert` block the compiler evaluates |
 | Not yet | signed integers, floating point, bit-level fields, a `constexpr` writer, `std::expected` return type for C++23 users |
 
 ## Development
